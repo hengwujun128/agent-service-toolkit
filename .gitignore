@@ -191,3 +191,8 @@ cython_debug/
 # Private Credentials, ignore everything in the folder but the .gitkeep file
 privatecredentials/*
 !privatecredentials/.gitkeep
+
+# Learning notes (my personal study)
+my-notes/
+learning/
+check-remote-updates.sh

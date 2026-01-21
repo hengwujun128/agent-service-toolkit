@@ -138,6 +138,13 @@ class TextToSpeech:
         """
         provider = os.getenv("VOICE_TTS_PROVIDER")
 
+        # Clean up provider value: strip whitespace and ignore if it's a comment
+        if provider:
+            provider = provider.strip()
+            # If value starts with #, treat it as unset (likely a comment line was read)
+            if not provider or provider.startswith("#"):
+                provider = None
+
         # If provider not set, voice features are disabled
         if not provider:
             logger.debug("VOICE_TTS_PROVIDER not set, TTS disabled")
