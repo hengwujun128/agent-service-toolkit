@@ -29,7 +29,7 @@ class AgentClient:
         self,
         base_url: str = "http://0.0.0.0",
         agent: str | None = None,
-        timeout: float | None = None,
+        timeout: float | None = 30.0,  # 默认 30 秒超时
         get_info: bool = True,
     ) -> None:
         """
@@ -58,21 +58,90 @@ class AgentClient:
         if self.auth_secret:
             headers["Authorization"] = f"Bearer {self.auth_secret}"
         return headers
+    
+    def _is_localhost(self) -> bool:
+        """Check if base_url is localhost."""
+        return "localhost" in self.base_url or "127.0.0.1" in self.base_url or "0.0.0.0" in self.base_url
+    
+    def _get_httpx_client(self, **kwargs) -> httpx.Client:
+        """Create an httpx client with proper configuration for localhost."""
+        from httpx._transports.default import HTTPTransport
+        
+        client_kwargs = {
+            "timeout": self.timeout or 30.0,
+            "follow_redirects": True,
+            "http2": False,
+            **kwargs,
+        }
+        
+        # For localhost, use a transport that doesn't use proxy
+        if self._is_localhost():
+            client_kwargs["transport"] = HTTPTransport()
+        
+        return httpx.Client(**client_kwargs)
 
     def retrieve_info(self) -> None:
         try:
-            response = httpx.get(
-                f"{self.base_url}/info",
-                headers=self._headers,
-                timeout=self.timeout,
-            )
+            # Use a longer timeout for the initial connection
+            # This helps when the service is still initializing
+            connect_timeout = 10.0  # 10 seconds to establish connection
+            read_timeout = 30.0     # 30 seconds to read response
+            timeout = httpx.Timeout(connect_timeout, read=read_timeout)
+            
+            # Use the helper method to create a properly configured client
+            with self._get_httpx_client(timeout=timeout) as client:
+                response = client.get(
+                    f"{self.base_url}/info",
+                    headers=self._headers,
+                )
             response.raise_for_status()
+            
+            # Check if response has content
+            if not response.content:
+                raise AgentClientError(
+                    f"Empty response from {self.base_url}/info. "
+                    "The service may not be fully started yet. "
+                    "Please wait a few seconds and try again."
+                )
+            
+            # Try to parse JSON
+            try:
+                json_data = response.json()
+            except ValueError as e:
+                # Response is not valid JSON - might be HTML error page or empty
+                content_preview = response.text[:200] if response.text else "(empty)"
+                raise AgentClientError(
+                    f"Invalid JSON response from {self.base_url}/info. "
+                    f"Response preview: {content_preview}. "
+                    "The service may not be fully started or may have encountered an error. "
+                    f"Original error: {e}"
+                )
+            
+            self.info = ServiceMetadata.model_validate(json_data)
+            if not self.agent or self.agent not in [a.key for a in self.info.agents]:
+                self.agent = self.info.default_agent
         except httpx.HTTPError as e:
-            raise AgentClientError(f"Error getting service info: {e}")
-
-        self.info = ServiceMetadata.model_validate(response.json())
-        if not self.agent or self.agent not in [a.key for a in self.info.agents]:
-            self.agent = self.info.default_agent
+            raise AgentClientError(
+                f"HTTP error getting service info from {self.base_url}/info: {e}. "
+                "Please ensure the service is running and accessible."
+            )
+        except httpx.TimeoutException as e:
+            raise AgentClientError(
+                f"Timeout connecting to {self.base_url}/info. "
+                "The service may be starting up or not responding. "
+                "Please wait a few seconds and try again."
+            )
+        except httpx.ConnectError as e:
+            raise AgentClientError(
+                f"Cannot connect to {self.base_url}/info. "
+                "Please ensure the service is running. "
+                f"Original error: {e}"
+            )
+        except httpx.ConnectTimeout as e:
+            raise AgentClientError(
+                f"Connection timeout to {self.base_url}/info. "
+                "The service may be starting up. Please wait a few seconds and try again."
+            )
 
     def update_agent(self, agent: str, verify: bool = True) -> None:
         if verify:
@@ -117,13 +186,22 @@ class AgentClient:
             request.agent_config = agent_config
         if user_id:
             request.user_id = user_id
-        async with httpx.AsyncClient() as client:
+        # For async, we need to handle localhost differently
+        # Create transport without proxy for localhost
+        transport = None
+        if self._is_localhost():
+            from httpx._transports.default import AsyncHTTPTransport
+            transport = AsyncHTTPTransport()
+        
+        async with httpx.AsyncClient(
+            timeout=self.timeout or 30.0,
+            transport=transport,
+        ) as client:
             try:
                 response = await client.post(
                     f"{self.base_url}/{self.agent}/invoke",
                     json=request.model_dump(),
                     headers=self._headers,
-                    timeout=self.timeout,
                 )
                 response.raise_for_status()
             except httpx.HTTPError as e:
@@ -164,13 +242,13 @@ class AgentClient:
         if user_id:
             request.user_id = user_id
         try:
-            response = httpx.post(
-                f"{self.base_url}/{self.agent}/invoke",
-                json=request.model_dump(),
-                headers=self._headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
+            with self._get_httpx_client() as client:
+                response = client.post(
+                    f"{self.base_url}/{self.agent}/invoke",
+                    json=request.model_dump(),
+                    headers=self._headers,
+                )
+                response.raise_for_status()
         except httpx.HTTPError as e:
             raise AgentClientError(f"Error: {e}")
 
@@ -240,21 +318,30 @@ class AgentClient:
             request.model = model  # type: ignore[assignment]
         if agent_config:
             request.agent_config = agent_config
+        # For streaming, create a client with proper transport
+        transport = None
+        if self._is_localhost():
+            from httpx._transports.default import HTTPTransport
+            transport = HTTPTransport()
+        
         try:
-            with httpx.stream(
-                "POST",
-                f"{self.base_url}/{self.agent}/stream",
-                json=request.model_dump(),
-                headers=self._headers,
-                timeout=self.timeout,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if line.strip():
-                        parsed = self._parse_stream_line(line)
-                        if parsed is None:
-                            break
-                        yield parsed
+            with httpx.Client(
+                timeout=self.timeout or 30.0,
+                transport=transport,
+            ) as client:
+                with client.stream(
+                    "POST",
+                    f"{self.base_url}/{self.agent}/stream",
+                    json=request.model_dump(),
+                    headers=self._headers,
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if line.strip():
+                            parsed = self._parse_stream_line(line)
+                            if parsed is None:
+                                break
+                            yield parsed
         except httpx.HTTPError as e:
             raise AgentClientError(f"Error: {e}")
 
@@ -297,14 +384,22 @@ class AgentClient:
             request.agent_config = agent_config
         if user_id:
             request.user_id = user_id
-        async with httpx.AsyncClient() as client:
+        # For async streaming, create transport without proxy for localhost
+        transport = None
+        if self._is_localhost():
+            from httpx._transports.default import AsyncHTTPTransport
+            transport = AsyncHTTPTransport()
+        
+        async with httpx.AsyncClient(
+            timeout=self.timeout or 30.0,
+            transport=transport,
+        ) as client:
             try:
                 async with client.stream(
                     "POST",
                     f"{self.base_url}/{self.agent}/stream",
                     json=request.model_dump(),
                     headers=self._headers,
-                    timeout=self.timeout,
                 ) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -351,13 +446,13 @@ class AgentClient:
         """
         request = ChatHistoryInput(thread_id=thread_id)
         try:
-            response = httpx.post(
-                f"{self.base_url}/history",
-                json=request.model_dump(),
-                headers=self._headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
+            with self._get_httpx_client() as client:
+                response = client.post(
+                    f"{self.base_url}/history",
+                    json=request.model_dump(),
+                    headers=self._headers,
+                )
+                response.raise_for_status()
         except httpx.HTTPError as e:
             raise AgentClientError(f"Error: {e}")
 

@@ -113,6 +113,7 @@ class Settings(BaseSettings):
         "https://api.smith.langchain.com"
     )
     LANGCHAIN_API_KEY: SecretStr | None = None
+    LANGSMITH_WORKSPACE_ID: str | None = None
 
     LANGFUSE_TRACING: bool = False
     LANGFUSE_HOST: Annotated[str, BeforeValidator(check_str_is_http)] = "https://cloud.langfuse.com"

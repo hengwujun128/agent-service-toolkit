@@ -7,6 +7,13 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
+# Use UUID v7 for LangSmith run_id (required by LangSmith)
+try:
+    from langsmith import uuid7
+except ImportError:
+    # Fallback to uuid4 if langsmith is not available
+    from uuid import uuid4 as uuid7
+
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
@@ -41,6 +48,13 @@ from service.utils import (
 )
 
 warnings.filterwarnings("ignore", category=LangChainBetaWarning)
+# Suppress UUID v7 warning from pydantic v1 (used internally by LangChain)
+# This warning appears because pydantic v1 doesn't natively support UUID v7,
+# but langsmith.uuid7() returns a valid UUID that works correctly with LangSmith
+warnings.filterwarnings(
+    "ignore",
+    message=".*LangSmith now uses UUID v7.*",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -120,7 +134,7 @@ async def _handle_input(user_input: UserInput, agent: AgentGraph) -> tuple[dict[
     Parse user input and handle any required interrupt resumption.
     Returns kwargs for agent invocation and the run_id.
     """
-    run_id = uuid4()
+    run_id = uuid7()
     thread_id = user_input.thread_id or str(uuid4())
     user_id = user_input.user_id or str(uuid4())
 
@@ -380,15 +394,29 @@ async def feedback(feedback: Feedback) -> FeedbackResponse:
     credentials can be stored and managed in the service rather than the client.
     See: https://api.smith.langchain.com/redoc#tag/feedback/operation/create_feedback_api_v1_feedback_post
     """
-    client = LangsmithClient()
-    kwargs = feedback.kwargs or {}
-    client.create_feedback(
-        run_id=feedback.run_id,
-        key=feedback.key,
-        score=feedback.score,
-        **kwargs,
-    )
-    return FeedbackResponse()
+    # Check if LangSmith is configured
+    if not settings.LANGCHAIN_API_KEY:
+        logger.warning("LangSmith API key not configured. Feedback will not be recorded.")
+        # Return success to avoid breaking the UI, but log the warning
+        return FeedbackResponse()
+
+    try:
+        client = LangsmithClient()
+        kwargs = feedback.kwargs or {}
+        client.create_feedback(
+            run_id=feedback.run_id,
+            key=feedback.key,
+            score=feedback.score,
+            **kwargs,
+        )
+        logger.debug(f"Feedback recorded for run_id: {feedback.run_id}")
+        return FeedbackResponse()
+    except Exception as e:
+        # Log the error but don't crash the service
+        # This allows the UI to continue working even if LangSmith is misconfigured
+        logger.error(f"Failed to record feedback to LangSmith: {e}")
+        # Return success to avoid breaking the UI
+        return FeedbackResponse()
 
 
 @router.post("/history")

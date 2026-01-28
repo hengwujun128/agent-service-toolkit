@@ -84,15 +84,62 @@ async def main() -> None:
         load_dotenv()
         agent_url = os.getenv("AGENT_URL")
         if not agent_url:
-            host = os.getenv("HOST", "0.0.0.0")
+            # Use localhost instead of 0.0.0.0 for client connections
+            # 0.0.0.0 is for server binding, not for client connections
+            host = os.getenv("HOST", "localhost")
+            # If HOST is set to 0.0.0.0, use localhost instead for client
+            if host == "0.0.0.0":
+                host = "localhost"
             port = os.getenv("PORT", 8080)
             agent_url = f"http://{host}:{port}"
-        try:
-            with st.spinner("Connecting to agent service..."):
-                st.session_state.agent_client = AgentClient(base_url=agent_url)
-        except AgentClientError as e:
-            st.error(f"Error connecting to agent service at {agent_url}: {e}")
-            st.markdown("The service might be booting up. Try again in a few seconds.")
+        
+        # Try to connect with retries
+        max_retries = 3
+        retry_delay = 2  # seconds
+        connected = False
+        
+        for attempt in range(max_retries):
+            try:
+                with st.spinner(f"Connecting to agent service... (attempt {attempt + 1}/{max_retries})"):
+                    st.session_state.agent_client = AgentClient(base_url=agent_url)
+                    connected = True
+                    break
+            except AgentClientError as e:
+                if attempt < max_retries - 1:
+                    # Wait before retrying
+                    import time
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    # Last attempt failed
+                    st.error(f"❌ Error connecting to agent service at `{agent_url}`")
+                    st.error(f"**Details**: {e}")
+                    st.markdown("### Troubleshooting:")
+                    st.markdown("""
+                    1. **Check if the service is running**: 
+                       - Make sure you've started the FastAPI service with `python src/run_service.py`
+                       - Check the service logs for any startup errors
+                       - You should see "Application startup complete" in the service logs
+                    
+                    2. **Check the service URL**:
+                       - Default URL is `http://0.0.0.0:8080`
+                       - You can override with `AGENT_URL` environment variable
+                       - Test with: `curl http://0.0.0.0:8080/info`
+                    
+                    3. **Check authentication**:
+                       - If you set `AUTH_SECRET` in service `.env`, make sure it's also in Streamlit `.env`
+                       - Or remove `AUTH_SECRET` if you don't need authentication
+                    
+                    4. **Wait and retry**:
+                       - The service may still be initializing
+                       - Click "Rerun" button or refresh the page
+                    """)
+                    if st.button("🔄 Retry Connection"):
+                        st.rerun()
+                    st.stop()
+        
+        if not connected:
+            st.error("Failed to connect after multiple attempts")
             st.stop()
     agent_client: AgentClient = st.session_state.agent_client
 
