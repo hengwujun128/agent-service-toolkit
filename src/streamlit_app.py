@@ -24,7 +24,7 @@ from voice import VoiceManager
 # The app heavily uses AgentClient to interact with the agent's FastAPI endpoints.
 
 
-APP_TITLE = "Agent Service Toolkit"
+APP_TITLE = "My Agent Service Toolkit"
 APP_ICON = "🧰"
 USER_ID_COOKIE = "user_id"
 
@@ -51,6 +51,7 @@ def get_or_create_user_id() -> str:
     st.query_params[USER_ID_COOKIE] = user_id
 
     return user_id
+
 
 
 async def main() -> None:
